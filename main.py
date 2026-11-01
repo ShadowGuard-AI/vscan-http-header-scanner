@@ -30,7 +30,9 @@ def get_headers(url):
         dict: A dictionary containing the HTTP headers.  Returns None on error.
     """
     try:
+        # Redirects are followed, so the headers I check belong to the page the chain ends on. A short URL or a login bounce is judged by its destination, and the headers of every hop in between, including the first servers own missing HSTS, are never seen.
         response = requests.get(url, allow_redirects=True, timeout=10)
+        # This turns an error page into a failed fetch, so its headers are never checked at all. Error pages are exactly where a missing content type guard tends to matter, and this scan reports them as unscanned instead of examining what they sent.
         response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
         return response.headers
     except requests.exceptions.RequestException as e:
@@ -87,6 +89,7 @@ def check_security_headers(headers, url):
         logging.warning(f"{url}: Missing Content-Security-Policy header")
     else:
         csp_header = headers['Content-Security-Policy']
+        # Two substrings are the whole policy review. A policy of star wildcards, or one pointing at a hostile host, passes clean here, while a safe policy that happens to quote one of these words in a report URI would be flagged.
         if "unsafe-inline" in csp_header.lower() or "unsafe-eval" in csp_header.lower():
              results['Content-Security-Policy'] = f"Content-Security-Policy includes potentially unsafe directives: {csp_header}"
              logging.warning(f"{url}: Content-Security-Policy includes potentially unsafe directives: {csp_header}")
@@ -129,6 +132,7 @@ def crawl_and_scan(url):
     soup = BeautifulSoup(response.content, 'html.parser')
     links = [a['href'] for a in soup.find_all('a', href=True)]
 
+    # The crawl goes one level deep and no further, and the starting page is fetched twice on the way: once to read its links and once here to read its headers. A slow or stateful starting page can give two different answers to those two reads.
     results[url] = scan_url(url) # Scan the initial URL
 
     origin = urlparse(url)
@@ -139,6 +143,7 @@ def crawl_and_scan(url):
         #Avoid external URLs in the crawling process: same scheme and host only.
         target = urlparse(absolute_url)
         if (target.scheme, target.netloc) == (origin.scheme, origin.netloc):
+            # The dedup key is the full string, fragment included. A page linking to itself with ten different anchors is fetched and scanned ten extra times, while the same address written with and without a trailing slash also counts as two pages.
             if absolute_url not in results:
                 results[absolute_url] = scan_url(absolute_url) # Scan each discovered link
         else:
@@ -157,6 +162,7 @@ def scan_url(url):
     """
     headers = get_headers(url)
     if headers is not None:
+        # The raw headers are stored whole in the result, values included. Masking only happens in the printing helper, so a caller who takes this dict and writes it somewhere gets the cookie and authorization values the console output was careful to hide.
         return {"findings": check_security_headers(headers, url),
                 "raw_headers": dict(headers), "failed": False}
     else:
@@ -216,6 +222,7 @@ def save_results(results, filename):
                 findings = entry.get("findings", {})
                 if findings:
                     for header, issue in findings.items():
+                        # The saved file is a summary, not the scan. It omits the raw headers even when the caller asked for them on screen, and a failed save is only logged, so the console can announce results saved for a file that does not exist.
                         f.write(f"  - {header}: {issue}\n")
                 else:
                     f.write("  - No security issues found.\n")
