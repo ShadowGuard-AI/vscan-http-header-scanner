@@ -3,6 +3,7 @@ import requests
 import logging
 from bs4 import BeautifulSoup
 import sys
+from urllib.parse import urljoin, urlparse
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -15,7 +16,7 @@ def setup_argparse():
     parser.add_argument("url", help="The URL to scan.")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose output (debug logging).")
     parser.add_argument("-o", "--output", help="Output file to save results (optional).")
-    parser.add_argument("-r", "--raw", action="store_true", help="Print raw headers (optional).")
+    parser.add_argument("-r", "--raw", action="store_true", help="Print the fetched raw headers for each scanned URL (credential shaped header values are masked).")
     return parser
 
 def get_headers(url):
@@ -116,25 +117,32 @@ def crawl_and_scan(url):
     try:
         response = requests.get(url, timeout=10)
         response.raise_for_status()
-        soup = BeautifulSoup(response.content, 'html.parser')
-        links = [a['href'] for a in soup.find_all('a', href=True)]
-
-        results[url] = scan_url(url) # Scan the initial URL
-
-        for link in links:
-            # Handle relative URLs
-            absolute_url = link if link.startswith('http') else f"{url.rstrip('/')}/{link.lstrip('/')}"
-
-            #Avoid external URLs in the crawling process
-            if absolute_url.startswith(url):
-                results[absolute_url] = scan_url(absolute_url) # Scan each discovered link
-            else:
-                logging.info(f"Skipping external URL: {absolute_url}")
-
     except requests.exceptions.RequestException as e:
         logging.error(f"Error crawling {url}: {e}")
+        results[url] = {"findings": {}, "raw_headers": None, "failed": True}
+        return results
     except Exception as e:
         logging.error(f"An unexpected error occurred during crawling: {e}")
+        results[url] = {"findings": {}, "raw_headers": None, "failed": True}
+        return results
+
+    soup = BeautifulSoup(response.content, 'html.parser')
+    links = [a['href'] for a in soup.find_all('a', href=True)]
+
+    results[url] = scan_url(url) # Scan the initial URL
+
+    origin = urlparse(url)
+    for link in links:
+        # Resolve relative links against the page URL itself.
+        absolute_url = urljoin(url, link)
+
+        #Avoid external URLs in the crawling process: same scheme and host only.
+        target = urlparse(absolute_url)
+        if (target.scheme, target.netloc) == (origin.scheme, origin.netloc):
+            if absolute_url not in results:
+                results[absolute_url] = scan_url(absolute_url) # Scan each discovered link
+        else:
+            logging.info(f"Skipping external URL: {absolute_url}")
     return results
 
 def scan_url(url):
@@ -148,10 +156,23 @@ def scan_url(url):
         dict: A dictionary of results for the URL.
     """
     headers = get_headers(url)
-    if headers:
-        return check_security_headers(headers, url)
+    if headers is not None:
+        return {"findings": check_security_headers(headers, url),
+                "raw_headers": dict(headers), "failed": False}
     else:
-        return {}
+        return {"findings": {}, "raw_headers": None, "failed": True}
+
+SENSITIVE_HEADER_NAMES = {"set-cookie", "cookie", "authorization", "proxy-authorization"}
+
+def format_raw_headers(raw_headers):
+    """Renders fetched headers, with credential shaped values masked."""
+    lines = []
+    for name, value in (raw_headers or {}).items():
+        if name.lower() in SENSITIVE_HEADER_NAMES:
+            lines.append(f"    {name}: ***")
+        else:
+            lines.append(f"    {name}: {value}")
+    return lines
 
 def print_results(results, raw_headers=False):
     """
@@ -161,13 +182,21 @@ def print_results(results, raw_headers=False):
         results (dict): A dictionary of scan results.
         raw_headers (bool): Whether to print raw headers.
     """
-    for url, findings in results.items():
+    for url, entry in results.items():
         print(f"Scanning URL: {url}")
+        if entry.get("failed"):
+            print("  - Fetch failed: this URL was not scanned.")
+            continue
+        findings = entry.get("findings", {})
         if findings:
             for header, issue in findings.items():
                 print(f"  - {header}: {issue}")
         else:
             print("  - No security issues found.")
+        if raw_headers:
+            print("  Raw headers:")
+            for line in format_raw_headers(entry.get("raw_headers")):
+                print(line)
 
 def save_results(results, filename):
     """
@@ -179,8 +208,12 @@ def save_results(results, filename):
     """
     try:
         with open(filename, "w") as f:
-            for url, findings in results.items():
+            for url, entry in results.items():
                 f.write(f"Scanning URL: {url}\n")
+                if entry.get("failed"):
+                    f.write("  - Fetch failed: this URL was not scanned.\n")
+                    continue
+                findings = entry.get("findings", {})
                 if findings:
                     for header, issue in findings.items():
                         f.write(f"  - {header}: {issue}\n")
@@ -209,6 +242,10 @@ def main():
     if args.output:
         save_results(results, args.output)
         logging.info(f"Results saved to: {args.output}")
+
+    if results.get(url, {}).get("failed"):
+        logging.error("Scan failed: the initial URL could not be fetched.")
+        sys.exit(1)
 
     logging.info("Scan completed.")
 
